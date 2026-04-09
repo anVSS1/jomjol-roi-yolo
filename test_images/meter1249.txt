@@ -1,0 +1,8 @@
+camera: LG G3 D855
+reading: 16148
+position: 1056 1666 411 91
+	digit 1: 1062 1677 40 78
+	digit 2: 1149 1677 51 75
+	digit 3: 1240 1680 37 72
+	digit 4: 1328 1674 40 72
+	digit 5: 1411 1669 46 73

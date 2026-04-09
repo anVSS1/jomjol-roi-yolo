@@ -1,0 +1,8 @@
+ultralytics>=8.0.0
+tensorflow>=2.10.0
+opencv-python>=4.8.0
+numpy>=1.23.0,<2.0.0
+matplotlib>=3.7.0
+roboflow>=1.1.0
+PyYAML>=6.0.0
+tqdm>=4.66.0
