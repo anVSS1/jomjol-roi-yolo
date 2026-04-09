@@ -29,7 +29,9 @@
   },
   "files.exclude": {
     "**/.venv": true,
-
+    "**/machine_a/output/**": true,
+    "**/machine_b/debug_outputs/**": true,
+    "**/test_images/**": true
   },
   "python.analysis.exclude": [
     "**/.venv/**",

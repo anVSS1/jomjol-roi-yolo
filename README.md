@@ -38,18 +38,32 @@ pip install -r requirements.txt
 
 Open two terminals in the project root.
 
+Project root:
+
+`C:\Users\AGA GAMING\OneDrive\Desktop\roi jomjol`
+
 ### Terminal 1: Start Machine B server
 
 ```powershell
+cd "C:\Users\AGA GAMING\OneDrive\Desktop\roi jomjol"
 .\.venv\Scripts\Activate.ps1
-python machine_b\receive_and_read.py --host 127.0.0.1 --port 9999 --model-path models\cnn_model.keras --debug-dir machine_b\debug_outputs\run_local
+python machine_b\receive_and_read.py --host 127.0.0.1 --port 9999 --model-path models\cnn_model.keras --debug-dir machine_b\debug_outputs\run_test2
 ```
 
 ### Terminal 2: Run Machine A client
 
-For a folder of test images:
+For test2 folder:
 
 ```powershell
+cd "C:\Users\AGA GAMING\OneDrive\Desktop\roi jomjol"
+.\.venv\Scripts\Activate.ps1
+python machine_a\detect_and_send.py --input test2 --model-path models\roi_model\yolo_model.pt --host 127.0.0.1 --port 9999 --output-dir machine_a\output\run_test2 --save-roi
+```
+
+For test_images folder:
+
+```powershell
+cd "C:\Users\AGA GAMING\OneDrive\Desktop\roi jomjol"
 .\.venv\Scripts\Activate.ps1
 python machine_a\detect_and_send.py --input test_images --model-path models\roi_model\yolo_model.pt --host 127.0.0.1 --port 9999 --output-dir machine_a\output\run_local --save-roi
 ```
@@ -57,7 +71,21 @@ python machine_a\detect_and_send.py --input test_images --model-path models\roi_
 For a single image:
 
 ```powershell
-python machine_a\detect_and_send.py --input path\to\meter_image.jpg --output-dir machine_a\output\single_test --save-roi
+cd "C:\Users\AGA GAMING\OneDrive\Desktop\roi jomjol"
+.\.venv\Scripts\Activate.ps1
+python machine_a\detect_and_send.py --input path\to\meter_image.jpg --model-path models\roi_model\yolo_model.pt --host 127.0.0.1 --port 9999 --output-dir machine_a\output\single_test --save-roi
+```
+
+If you are already inside machine_b:
+
+```powershell
+python receive_and_read.py --host 127.0.0.1 --port 9999 --model-path ..\models\cnn_model.keras --debug-dir debug_outputs\run_test2
+```
+
+If you are already inside machine_a:
+
+```powershell
+python detect_and_send.py --input ..\test2 --model-path ..\models\roi_model\yolo_model.pt --host 127.0.0.1 --port 9999 --output-dir output\run_test2 --save-roi
 ```
 
 ## Expected outputs
@@ -92,3 +120,13 @@ From notebook outputs in `train_cnn_ufpr_amr.ipynb`:
 - Train/test split: 7,968 / 1,992
 - Final reported hold-out accuracy: 99.00%
 - EarlyStopping triggered at epoch 124, restoring best epoch 104
+
+## Limitations
+
+The system was designed and validated primarily on the UFPR-AMR dataset style meters. As a result, there are some expected generalization limitations:
+
+- ✅ The system works well on standard water meter digit strips in the UFPR-AMR distribution.
+- ❌ It does not generalize to novel meter types not seen during training.
+- ❌ It struggles with extreme rotations due to standard bounding box training.
+- ❌ The Otsu segmentation assumes a specific visual contrast that colored meters violate.
+

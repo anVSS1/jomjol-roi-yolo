@@ -185,6 +185,15 @@ The gap between component-level accuracy and end-to-end reading accuracy is main
     \caption{Example of under-segmentation caused by glare and reflection, leading to an incorrect full reading.}
 \end{figure}
 
+\subsection{System Limitations}
+While the proposed system demonstrates strong performance on the UFPR-AMR dataset distribution, it exhibits several generalization limitations consistent with the domain shift problem in computer vision:
+\begin{itemize}
+    \item \textbf{Novel Meter Types:} The YOLOv8 detector was trained exclusively on UFPR-AMR meters and struggles to generalize to completely unseen meter styles, colors, or shapes.
+    \item \textbf{Extreme Rotations:} The model relies on standard axis-aligned bounding boxes and limited rotation augmentation during training, leading to failures on heavily rotated images.
+    \item \textbf{Otsu Segmentation Assumptions:} The classical Otsu thresholding step assumes a bimodal grayscale distribution (e.g., dark digits on a light background). This assumption breaks down when applied to colored or heavily stylized meter dials, causing downstream segmentation failures.
+\end{itemize}
+These findings highlight the trade-off between the high accuracy achieved on in-distribution data and the challenges of zero-shot generalization to unconstrained real-world environments.
+
 \section{Benchmark and Positioning}
 
 To position the proposed method with respect to prior work, Table~\ref{tab:benchmark} compares our architecture against existing AMR solutions across key deployment dimensions.
@@ -212,7 +221,9 @@ As shown in the benchmark, classical pipelines remain sensitive to environmental
 \section{Conclusion and Perspectives}
 This paper presented a fully automated distributed AMR system that combines YOLO-based ROI detection with CNN-based digit classification. The proposed architecture directly addresses the deployment bottleneck created by manual ROI configuration in existing edge-based workflows. By separating detection and inference across two nodes, the system also offers a practical path toward scalable and modular deployment.
 
-Experimental results show strong component-level performance, with 100\% ROI detection success and 99.00\% digit classification accuracy. However, end-to-end performance remains limited by segmentation errors under difficult lighting conditions. Future work should focus on replacing the deterministic projection-based segmentation step with a sequence modeling approach such as CTC-based OCR or an end-to-end recognition network. This would likely improve full-reading accuracy and reduce sensitivity to glare and under-segmentation.
+Experimental results show strong component-level performance, with 100\% ROI detection success and 99.00\% digit classification accuracy on the local test set. However, end-to-end performance remains limited by segmentation errors under difficult lighting conditions and generalization challenges on novel meter types. 
+
+Future work should directly address these generalization constraints. To handle extreme rotations, the detection stage could be upgraded to use Oriented Bounding Boxes (OBB) or trained with aggressive affine augmentations. Furthermore, to overcome the limitations of Otsu segmentation and improve resilience against domain shifts (such as colored dials), the deterministic projection-based step should be replaced with a sequence modeling approach—such as a CRNN with CTC loss—or an end-to-end object detector for individual digits. This would eliminate hard segmentation assumptions, improving full-reading accuracy across diverse meter types and reducing sensitivity to glare.
 
 \begin{thebibliography}{99}
 
