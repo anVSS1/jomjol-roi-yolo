@@ -13,6 +13,7 @@ from ultralytics import YOLO
 
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+YOLO_ROTATION_RETRY_ANGLES = [10, -10, 20, -20, 30, -30, 45, -45]
 
 
 @dataclass
@@ -23,6 +24,8 @@ class DetectionResult:
     y2: int
     confidence: float
     method: str
+    rotation_angle: float = 0.0
+    rotated_box: Optional[tuple[int, int, int, int]] = None
 
 
 def resolve_yolo_model_path(requested_path: str) -> Path:
@@ -152,7 +155,146 @@ def detect_roi_yolo(
         y2=int(round(y2)),
         confidence=float(confs[best_idx]),
         method="yolo",
+        rotation_angle=0.0,
+        rotated_box=None,
     )
+
+
+def rotate_keep_bounds(image_bgr: np.ndarray, angle_degrees: float) -> tuple[np.ndarray, np.ndarray]:
+    h, w = image_bgr.shape[:2]
+    center = (w / 2.0, h / 2.0)
+
+    rotation = cv2.getRotationMatrix2D(center, angle_degrees, 1.0)
+    abs_cos = abs(rotation[0, 0])
+    abs_sin = abs(rotation[0, 1])
+
+    new_w = int((h * abs_sin) + (w * abs_cos))
+    new_h = int((h * abs_cos) + (w * abs_sin))
+
+    rotation[0, 2] += (new_w / 2.0) - center[0]
+    rotation[1, 2] += (new_h / 2.0) - center[1]
+
+    rotated = cv2.warpAffine(
+        image_bgr,
+        rotation,
+        (new_w, new_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return rotated, rotation
+
+
+def _transform_points(points: np.ndarray, matrix_2x3: np.ndarray) -> np.ndarray:
+    ones = np.ones((points.shape[0], 1), dtype=np.float32)
+    hom = np.hstack([points.astype(np.float32), ones])
+    out = hom @ matrix_2x3.T
+    return out
+
+
+def map_detection_to_original(
+    det_rot: DetectionResult,
+    rot_matrix: np.ndarray,
+    original_shape: tuple[int, int, int],
+    angle_degrees: float,
+) -> Optional[DetectionResult]:
+    inv = cv2.invertAffineTransform(rot_matrix)
+
+    corners = np.array(
+        [
+            [det_rot.x1, det_rot.y1],
+            [det_rot.x2, det_rot.y1],
+            [det_rot.x2, det_rot.y2],
+            [det_rot.x1, det_rot.y2],
+        ],
+        dtype=np.float32,
+    )
+    mapped = _transform_points(corners, inv)
+
+    x_vals = mapped[:, 0]
+    y_vals = mapped[:, 1]
+
+    x1 = int(np.floor(np.min(x_vals)))
+    y1 = int(np.floor(np.min(y_vals)))
+    x2 = int(np.ceil(np.max(x_vals)))
+    y2 = int(np.ceil(np.max(y_vals)))
+
+    h, w = original_shape[:2]
+    clamped = clamp_box(x1, y1, x2, y2, width=w, height=h)
+    if clamped is None:
+        return None
+
+    cx1, cy1, cx2, cy2 = clamped
+    return DetectionResult(
+        x1=cx1,
+        y1=cy1,
+        x2=cx2,
+        y2=cy2,
+        confidence=det_rot.confidence,
+        method=f"yolo_rot{angle_degrees:g}",
+        rotation_angle=float(angle_degrees),
+        rotated_box=(det_rot.x1, det_rot.y1, det_rot.x2, det_rot.y2),
+    )
+
+
+def crop_from_rotated_detection(
+    image_bgr: np.ndarray,
+    rotation_angle: float,
+    rotated_box: tuple[int, int, int, int],
+) -> Optional[np.ndarray]:
+    rotated_img, _ = rotate_keep_bounds(image_bgr, rotation_angle)
+    rh, rw = rotated_img.shape[:2]
+    rx1, ry1, rx2, ry2 = rotated_box
+    clamped = clamp_box(rx1, ry1, rx2, ry2, width=rw, height=rh)
+    if clamped is None:
+        return None
+
+    cx1, cy1, cx2, cy2 = clamped
+    roi = rotated_img[cy1:cy2, cx1:cx2]
+    if roi.size == 0:
+        return None
+    return roi
+
+
+def detect_roi_yolo_with_rotation_retry(
+    model: YOLO,
+    image_bgr: np.ndarray,
+    conf_threshold: float,
+    imgsz: int,
+    device: str,
+    rotation_angles: list[float],
+) -> Optional[DetectionResult]:
+    first_try = detect_roi_yolo(
+        model=model,
+        image_bgr=image_bgr,
+        conf_threshold=conf_threshold,
+        imgsz=imgsz,
+        device=device,
+    )
+    if first_try is not None:
+        return first_try
+
+    for angle in rotation_angles:
+        rotated, rot_matrix = rotate_keep_bounds(image_bgr, angle)
+        det_rot = detect_roi_yolo(
+            model=model,
+            image_bgr=rotated,
+            conf_threshold=conf_threshold,
+            imgsz=imgsz,
+            device=device,
+        )
+        if det_rot is None:
+            continue
+
+        mapped = map_detection_to_original(
+            det_rot=det_rot,
+            rot_matrix=rot_matrix,
+            original_shape=image_bgr.shape,
+            angle_degrees=angle,
+        )
+        if mapped is not None:
+            return mapped
+
+    return None
 
 
 def _find_best_horizontal_rect(mask: np.ndarray, image_shape: tuple[int, int, int]) -> Optional[DetectionResult]:
@@ -383,16 +525,20 @@ def main() -> None:
 
             h, w = image.shape[:2]
 
-            detection = detect_roi_yolo(
+            detection = detect_roi_yolo_with_rotation_retry(
                 model=yolo_model,
                 image_bgr=image,
                 conf_threshold=args.conf,
                 imgsz=args.imgsz,
                 device=args.device,
+                rotation_angles=YOLO_ROTATION_RETRY_ANGLES,
             )
 
             if detection is None:
-                print("[Machine A] YOLO found no ROI. Trying OpenCV fallback...")
+                print(
+                    "[Machine A] YOLO found no ROI on original + rotated views. "
+                    "Trying OpenCV fallback..."
+                )
                 detection = detect_roi_fallback(image)
 
             reading = "NO_ROI"
@@ -414,6 +560,17 @@ def main() -> None:
                     x1, y1, x2, y2 = clamped
                     detection.x1, detection.y1, detection.x2, detection.y2 = x1, y1, x2, y2
                     roi = image[y1:y2, x1:x2]
+
+                    # If detection came from a rotated YOLO pass, send ROI cropped from
+                    # that rotated frame so digits are upright for downstream CNN logic.
+                    if detection.rotation_angle != 0.0 and detection.rotated_box is not None:
+                        upright_roi = crop_from_rotated_detection(
+                            image_bgr=image,
+                            rotation_angle=detection.rotation_angle,
+                            rotated_box=detection.rotated_box,
+                        )
+                        if upright_roi is not None:
+                            roi = upright_roi
 
                     if roi.size == 0:
                         print("[Machine A] ROI crop is empty after detection.")

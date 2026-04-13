@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""
+receive_and_read.py  —  Machine B
+
+All meters have exactly 5 digits.
+Split ROI into 5 equal strips → run CNN on each crop. That's it.
+"""
+
 import argparse
 import socket
 import struct
@@ -13,6 +20,9 @@ import numpy as np
 import tensorflow as tf
 
 
+N_DIGITS = 5   # ← all meters have 5 digits
+
+
 @dataclass
 class DigitSegment:
     x1: int
@@ -22,281 +32,168 @@ class DigitSegment:
     confidence: float
 
 
-def resolve_model_path(requested_path: str) -> Path:
-    """Resolve CNN model path using cnn_model.keras naming."""
-    requested = Path(requested_path)
-    candidates = [
-        requested,
-        Path("models/cnn_model.keras"),
-        Path("cnn_model.keras"),
-    ]
-
-    seen = set()
-    for candidate in candidates:
-        normalized = candidate.resolve() if candidate.exists() else candidate
-        key = str(normalized)
+def resolve_model_path(requested: str) -> Path:
+    candidates = [Path(requested), Path("models/cnn_model.keras"), Path("cnn_model.keras")]
+    seen: set[str] = set()
+    for c in candidates:
+        key = str(c.resolve() if c.exists() else c)
         if key in seen:
             continue
         seen.add(key)
-        if candidate.exists():
-            return candidate.resolve()
-
-    searched = "\n".join(f"- {c}" for c in candidates)
+        if c.exists():
+            return c.resolve()
     raise FileNotFoundError(
-        "Could not find the CNN model. Checked:\n"
-        f"{searched}\n\n"
-        "Expected filename: cnn_model.keras"
+        "cnn_model.keras not found. Checked:\n" + "\n".join(f"  {c}" for c in candidates)
     )
 
 
-def recvall(sock: socket.socket, size: int) -> Optional[bytes]:
-    """Receive exactly size bytes, or None if the socket closes."""
-    data = bytearray()
-    while len(data) < size:
-        packet = sock.recv(size - len(data))
-        if not packet:
+def recvall(sock: socket.socket, n: int) -> Optional[bytes]:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
             return None
-        data.extend(packet)
-    return bytes(data)
+        buf.extend(chunk)
+    return bytes(buf)
 
 
 def recv_message(sock: socket.socket) -> Optional[bytes]:
-    header = recvall(sock, 4)
-    if header is None:
+    hdr = recvall(sock, 4)
+    if hdr is None:
         return None
-    body_size = struct.unpack("!I", header)[0]
-    if body_size == 0:
-        return b""
-    return recvall(sock, body_size)
+    size = struct.unpack("!I", hdr)[0]
+    return b"" if size == 0 else recvall(sock, size)
 
 
-def send_message(sock: socket.socket, payload: bytes) -> None:
-    sock.sendall(struct.pack("!I", len(payload)) + payload)
+def send_message(sock: socket.socket, data: bytes) -> None:
+    sock.sendall(struct.pack("!I", len(data)) + data)
 
 
-def preprocess_roi(roi_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    if roi_bgr.ndim == 3:
-        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = roi_bgr.copy()
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SPLIT  —  divide ROI width into N_DIGITS equal strips
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Prefer white foreground (digits) for stable vertical projection.
-    white_ratio = float(np.count_nonzero(thresh)) / float(thresh.size)
-    if white_ratio > 0.60:
-        thresh = cv2.bitwise_not(thresh)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return gray, thresh
+def split_roi(roi_bgr: np.ndarray) -> list[tuple[int, int]]:
+    """Return N_DIGITS (x1, x2) strips of equal width across the ROI."""
+    h, w = roi_bgr.shape[:2]
+    sw   = w / N_DIGITS
+    margin = max(1, int(sw * 0.025))   # tiny overlap so digit edges aren't clipped
+    return [
+        (max(0,     int(i * sw)       - margin),
+         min(w - 1, int((i + 1) * sw) + margin))
+        for i in range(N_DIGITS)
+    ]
 
 
-def find_digit_boundaries(binary: np.ndarray) -> list[tuple[int, int]]:
-    h, w = binary.shape
-    col_activity = np.sum(binary > 0, axis=0)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CNN PREPARATION  —  must match training pipeline exactly
+#  BGR → RGB → resize(20, 32) → raw float32  (NO /255 — BatchNorm handles it)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    min_foreground_per_col = max(1, int(0.12 * h))
-    active_cols = col_activity >= min_foreground_per_col
-
-    boundaries: list[tuple[int, int]] = []
-    start = None
-    for x, is_active in enumerate(active_cols):
-        if is_active and start is None:
-            start = x
-        elif not is_active and start is not None:
-            boundaries.append((start, x))
-            start = None
-    if start is not None:
-        boundaries.append((start, w))
-
-    min_width = max(2, int(0.025 * w))
-    boundaries = [(s, e) for (s, e) in boundaries if (e - s) >= min_width]
-
-    if not boundaries:
-        return []
-
-    max_gap = max(1, int(0.01 * w))
-    merged = [boundaries[0]]
-    for s, e in boundaries[1:]:
-        ps, pe = merged[-1]
-        if s - pe <= max_gap:
-            merged[-1] = (ps, e)
-        else:
-            merged.append((s, e))
-
-    return merged
+def prepare_crop(bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if bgr.ndim == 2:
+        bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+    if bgr.shape[0] == 0 or bgr.shape[1] == 0:
+        bgr = np.full((32, 20, 3), 128, dtype=np.uint8)
+    resized = cv2.resize(bgr, (20, 32), interpolation=cv2.INTER_AREA)
+    rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    return rgb.astype(np.float32)[None, ...], resized   # (1, 32, 20, 3)
 
 
-def prepare_digit_for_model(digit_gray: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    resized = cv2.resize(digit_gray, (20, 32), interpolation=cv2.INTER_AREA)
-    rgb = cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FULL PIPELINE: split → CNN → reading
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # The model was trained on raw pixel values (no /255 normalization).
-    model_input = rgb.astype(np.float32)[None, ...]
-    return model_input, rgb
-
-
-def classify_segments(
-    gray: np.ndarray,
-    boundaries: list[tuple[int, int]],
+def extract_and_read_digits(
+    roi_bgr: np.ndarray,
     model: tf.keras.Model,
-) -> list[DigitSegment]:
+) -> tuple[str, list[DigitSegment]]:
+    strips   = split_roi(roi_bgr)
     segments: list[DigitSegment] = []
 
-    for x1, x2 in boundaries:
-        crop_gray = gray[:, x1:x2]
-        if crop_gray.size == 0:
+    for x1, x2 in strips:
+        crop = roi_bgr[:, x1:x2]
+        if crop.size == 0:
             continue
+        inp, display = prepare_crop(crop)
+        probs        = model.predict(inp, verbose=0)[0]
+        segments.append(DigitSegment(
+            x1=x1, x2=x2, crop=display,
+            pred_class=int(np.argmax(probs)),
+            confidence=float(np.max(probs)),
+        ))
 
-        model_input, resized_crop = prepare_digit_for_model(crop_gray)
-        probs = model.predict(model_input, verbose=0)[0]
-        pred_class = int(np.argmax(probs))
-        confidence = float(np.max(probs))
-
-        segments.append(
-            DigitSegment(
-                x1=x1,
-                x2=x2,
-                crop=resized_crop,
-                pred_class=pred_class,
-                confidence=confidence,
-            )
-        )
-
-    segments.sort(key=lambda item: item.x1)
-    return segments
-
-
-def segments_to_reading(segments: list[DigitSegment]) -> str:
     if not segments:
-        return "NO_DIGITS"
+        return "NO_DIGITS", []
 
-    chars: list[str] = []
-    for segment in segments:
-        if segment.pred_class == 10:
-            chars.append("N")
-        elif 0 <= segment.pred_class <= 9:
-            chars.append(str(segment.pred_class))
-        else:
-            chars.append("?")
-    return "".join(chars)
+    reading = "".join(
+        "N"  if s.pred_class == 10 else
+        str(s.pred_class) if 0 <= s.pred_class <= 9 else "?"
+        for s in segments
+    )
+    return reading, segments
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DEBUG OUTPUT
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def build_digit_strip(segments: list[DigitSegment]) -> np.ndarray:
     if not segments:
         strip = np.full((70, 280, 3), 255, dtype=np.uint8)
-        cv2.putText(
-            strip,
-            "No digit crops detected",
-            (10, 42),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 0, 180),
-            2,
-            cv2.LINE_AA,
-        )
+        cv2.putText(strip, "No digits", (10, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 180), 2, cv2.LINE_AA)
         return strip
-
-    cell_w = 46
-    cell_h = 74
-    strip = np.full((cell_h, cell_w * len(segments), 3), 255, dtype=np.uint8)
-
-    for idx, seg in enumerate(segments):
-        resized = cv2.resize(seg.crop, (28, 48), interpolation=cv2.INTER_NEAREST)
-        x0 = idx * cell_w + 9
-        y0 = 6
-        strip[y0 : y0 + 48, x0 : x0 + 28] = resized
-
-        label = "N" if seg.pred_class == 10 else str(seg.pred_class)
-        conf_txt = f"{seg.confidence:.2f}"
-        cv2.putText(
-            strip,
-            f"{label}:{conf_txt}",
-            (idx * cell_w + 3, 68),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.35,
-            (20, 20, 20),
-            1,
-            cv2.LINE_AA,
-        )
-
+    cw, ch = 52, 80
+    strip  = np.full((ch, cw * len(segments), 3), 255, dtype=np.uint8)
+    for i, seg in enumerate(segments):
+        thumb = cv2.resize(seg.crop, (32, 56), interpolation=cv2.INTER_NEAREST)
+        strip[4:60, i * cw + 10 : i * cw + 42] = thumb
+        lbl = "N" if seg.pred_class == 10 else str(seg.pred_class)
+        cv2.putText(strip, f"{lbl}:{seg.confidence:.2f}",
+                    (i * cw + 2, 74), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.36, (20, 20, 20), 1, cv2.LINE_AA)
     return strip
 
 
 def save_debug_output(
     roi_bgr: np.ndarray,
-    binary: np.ndarray,
-    boundaries: list[tuple[int, int]],
     segments: list[DigitSegment],
     reading: str,
     frame_idx: int,
     output_dir: Path,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-
     annotated = roi_bgr.copy()
     for seg in segments:
-        cv2.rectangle(annotated, (seg.x1, 0), (seg.x2, annotated.shape[0] - 1), (0, 220, 0), 2)
-        cls_label = "N" if seg.pred_class == 10 else str(seg.pred_class)
-        cv2.putText(
-            annotated,
-            f"{cls_label}:{seg.confidence:.2f}",
-            (max(0, seg.x1 - 2), 16),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 80, 255),
-            1,
-            cv2.LINE_AA,
-        )
+        cv2.rectangle(annotated, (seg.x1, 0),
+                      (seg.x2, roi_bgr.shape[0] - 1), (0, 220, 0), 2)
+        lbl = "N" if seg.pred_class == 10 else str(seg.pred_class)
+        cv2.putText(annotated, f"{lbl}:{seg.confidence:.2f}",
+                    (max(0, seg.x1), 16), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (0, 60, 255), 1, cv2.LINE_AA)
+    strip = build_digit_strip(segments)
+    W = max(annotated.shape[1], strip.shape[1])
 
-    if not boundaries:
-        cv2.putText(
-            annotated,
-            "No boundaries found",
-            (8, 22),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 200),
-            2,
-            cv2.LINE_AA,
-        )
+    def pad(img, tw):
+        p = tw - img.shape[1]
+        return img if p <= 0 else cv2.copyMakeBorder(
+            img, 0, 0, 0, p, cv2.BORDER_CONSTANT, value=255)
 
-    binary_vis = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-    digit_strip = build_digit_strip(segments)
+    panel = np.vstack([pad(annotated, W), pad(strip, W)])
+    cv2.putText(panel, f"Reading: {reading}",
+                (10, panel.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                0.85, (0, 0, 200), 2, cv2.LINE_AA)
+    safe = "".join(c if c.isalnum() else "_" for c in reading)
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = output_dir / f"{frame_idx:05d}_{safe}_{ts}.jpg"
+    cv2.imwrite(str(path), panel)
+    return path
 
-    w = max(annotated.shape[1], binary_vis.shape[1], digit_strip.shape[1])
 
-    def pad_to_width(img: np.ndarray, target_w: int) -> np.ndarray:
-        pad = target_w - img.shape[1]
-        if pad <= 0:
-            return img
-        return cv2.copyMakeBorder(img, 0, 0, 0, pad, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-
-    panel_top = pad_to_width(annotated, w)
-    panel_mid = pad_to_width(binary_vis, w)
-    panel_bottom = pad_to_width(digit_strip, w)
-
-    panel = np.vstack([panel_top, panel_mid, panel_bottom])
-    cv2.putText(
-        panel,
-        f"Reading: {reading}",
-        (10, panel.shape[0] - 10),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (0, 0, 220),
-        2,
-        cv2.LINE_AA,
-    )
-
-    safe_reading = "".join(c if c.isalnum() else "_" for c in reading)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    out_path = output_dir / f"{frame_idx:05d}_{safe_reading}_{timestamp}.jpg"
-    cv2.imwrite(str(out_path), panel)
-    return out_path
-
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SERVER
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def process_roi(
     roi_bgr: np.ndarray,
@@ -305,131 +202,70 @@ def process_roi(
     debug_dir: Path,
     frame_idx: int,
 ) -> tuple[str, int, Optional[Path]]:
-    gray, binary = preprocess_roi(roi_bgr)
-    boundaries = find_digit_boundaries(binary)
-    segments = classify_segments(gray, boundaries, model)
-    reading = segments_to_reading(segments)
-
+    reading, segments = extract_and_read_digits(roi_bgr, model)
     debug_path = None
     if save_debug:
         debug_path = save_debug_output(
-            roi_bgr=roi_bgr,
-            binary=binary,
-            boundaries=boundaries,
-            segments=segments,
-            reading=reading,
-            frame_idx=frame_idx,
-            output_dir=debug_dir,
-        )
-
+            roi_bgr, segments, reading, frame_idx, debug_dir)
     return reading, len(segments), debug_path
 
 
-def handle_connection(
-    conn: socket.socket,
-    addr: tuple[str, int],
-    model: tf.keras.Model,
-    save_debug: bool,
-    debug_dir: Path,
-) -> None:
-    print(f"[Machine B] Client connected from {addr[0]}:{addr[1]}")
+def handle_connection(conn, addr, model, save_debug, debug_dir):
+    print(f"[Machine B] Connected: {addr[0]}:{addr[1]}")
     frame_idx = 0
-
     while True:
         payload = recv_message(conn)
         if payload is None:
             print("[Machine B] Client disconnected.")
             break
-
         frame_idx += 1
-        print(f"\n[Machine B] ---- Frame #{frame_idx} ----")
-
+        print(f"\n[Machine B] ── Frame #{frame_idx} ──")
         if len(payload) == 0:
-            reading = "EMPTY_PAYLOAD"
-            send_message(conn, reading.encode("utf-8"))
-            print("[Machine B] Received empty payload.")
+            send_message(conn, b"EMPTY_PAYLOAD")
             continue
-
-        arr = np.frombuffer(payload, dtype=np.uint8)
-        roi = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        roi = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
         if roi is None:
-            reading = "DECODE_ERROR"
-            send_message(conn, reading.encode("utf-8"))
-            print("[Machine B] Failed to decode JPEG bytes.")
+            send_message(conn, b"DECODE_ERROR")
             continue
-
-        reading, digit_count, debug_path = process_roi(
-            roi_bgr=roi,
-            model=model,
-            save_debug=save_debug,
-            debug_dir=debug_dir,
-            frame_idx=frame_idx,
-        )
-
+        reading, n, dp = process_roi(roi, model, save_debug, debug_dir, frame_idx)
         send_message(conn, reading.encode("utf-8"))
-        print(
-            "[Machine B] ROI shape="
-            f"{roi.shape[1]}x{roi.shape[0]} | digits={digit_count} | reading={reading}"
-        )
-        if debug_path is not None:
-            print(f"[Machine B] Debug image saved: {debug_path}")
+        print(f"[Machine B] {roi.shape[1]}x{roi.shape[0]} | digits={n} | reading={reading}")
+        if dp:
+            print(f"[Machine B] Debug: {dp}")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Machine B server: receives ROI images, segments digits, classifies, and returns reading."
-    )
-    parser.add_argument("--host", default="127.0.0.1", help="Host/IP to bind the socket server.")
-    parser.add_argument("--port", type=int, default=9999, help="Port to bind the socket server.")
-    parser.add_argument(
-        "--model-path",
-        default="models/cnn_model.keras",
-        help="Path to Keras digit classifier model file.",
-    )
-    parser.add_argument(
-        "--debug-dir",
-        default="machine_b/debug_outputs",
-        help="Folder to store segmentation and crop debug images.",
-    )
-    parser.add_argument(
-        "--no-debug-save",
-        action="store_true",
-        help="Disable writing debug images to disk.",
-    )
-    return parser.parse_args()
+def parse_args():
+    p = argparse.ArgumentParser(description="Machine B: 5-digit split + CNN reading")
+    p.add_argument("--host",          default="127.0.0.1")
+    p.add_argument("--port",          type=int, default=9999)
+    p.add_argument("--model-path",    default="models/cnn_model.keras")
+    p.add_argument("--debug-dir",     default="machine_b/debug_outputs")
+    p.add_argument("--no-debug-save", action="store_true")
+    return p.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    debug_dir = Path(args.debug_dir)
-
+def main():
+    args       = parse_args()
     model_path = resolve_model_path(args.model_path)
-    print(f"[Machine B] Loading CNN model from: {model_path}")
+    print(f"[Machine B] Model  : {model_path}")
+    print(f"[Machine B] Mode   : fixed {N_DIGITS}-digit equal split → CNN")
     model = tf.keras.models.load_model(model_path)
-
-    input_shape = getattr(model, "input_shape", None)
-    output_shape = getattr(model, "output_shape", None)
-    print(f"[Machine B] Model loaded. input_shape={input_shape}, output_shape={output_shape}")
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((args.host, args.port))
-        server.listen(4)
-        print(f"[Machine B] Listening on {args.host}:{args.port} ...")
-
+    print(f"[Machine B] input  : {model.input_shape}")    # (None, 32, 20, 3)
+    print(f"[Machine B] output : {model.output_shape}")   # (None, 11)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((args.host, args.port))
+        srv.listen(4)
+        print(f"[Machine B] Listening on {args.host}:{args.port}")
         try:
             while True:
-                conn, addr = server.accept()
+                conn, addr = srv.accept()
                 with conn:
-                    handle_connection(
-                        conn=conn,
-                        addr=addr,
-                        model=model,
-                        save_debug=not args.no_debug_save,
-                        debug_dir=debug_dir,
-                    )
+                    handle_connection(conn, addr, model,
+                                      not args.no_debug_save,
+                                      Path(args.debug_dir))
         except KeyboardInterrupt:
-            print("\n[Machine B] Stopped by user.")
+            print("\n[Machine B] Stopped.")
 
 
 if __name__ == "__main__":
