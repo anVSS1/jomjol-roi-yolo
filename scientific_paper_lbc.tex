@@ -11,6 +11,8 @@
 \usepackage{hyperref}
 \usepackage{enumitem}
 \usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{textcomp}
 \usepackage{setspace}
 \usepackage{tikz}
 \usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds}
@@ -25,9 +27,9 @@
 \maketitle
 
 \begin{abstract}
-Automated Meter Reading (AMR) is an important component of smart infrastructure, enabling utility providers to digitize meter readings without replacing existing hardware. However, many practical edge-based solutions still depend on manual Region of Interest (ROI) configuration, which limits scalability and increases deployment effort. This paper proposes a fully automated distributed AMR pipeline that removes this bottleneck through a two-stage architecture: a lightweight YOLOv8n detector automatically localizes the meter digit strip, and a custom CNN classifies segmented digits on a separate inference node through TCP communication. 
+Automated Meter Reading (AMR) is an important component of smart infrastructure, enabling utility providers to digitize meter readings without replacing existing hardware. However, many practical edge-based solutions still depend on manual Region of Interest (ROI) configuration, which limits scalability and increases deployment effort. This paper proposes a fully automated distributed AMR pipeline that removes this bottleneck through a two-stage architecture: a lightweight YOLOv8n detector automatically localizes the meter digit strip on Machine~A, and a custom CNN classifies segmented digits on Machine~B through TCP communication.
 
-To organize the discussion, the paper follows the LBC matrix: \textit{Literature} reviews prior AMR approaches and identifies the limitations of manual-ROI workflows, \textit{Business need} motivates the need for an autonomous and scalable system, and \textit{Contribution} presents the proposed distributed architecture and its experimental validation. The model achieves a 100\% ROI detection success rate on the local test set and 99.00\% hold-out accuracy for digit classification. End-to-end evaluation on an independent dataset reaches a 72.00\% exact full-reading match, showing that the proposed system is effective but still limited by segmentation errors under difficult lighting conditions.
+To organize the discussion, the paper follows the LBC matrix: \textit{Literature} reviews prior AMR approaches and identifies the limitations of manual-ROI workflows, \textit{Business need} motivates the need for an autonomous and scalable system, and \textit{Contribution} presents the proposed distributed architecture and its experimental validation. The model achieves a 100\% ROI detection success rate on the local test set and 99.00\% hold-out accuracy for digit classification. End-to-end evaluation on an independent dataset reaches a 72.00\% exact full-reading match, showing that the proposed system is effective but still limited by recognition errors under difficult lighting and tilt conditions.
 \end{abstract}
 
 \textbf{Keywords:} Automated Meter Reading, YOLOv8, CNN, Distributed Inference, Edge Computing, ROI Detection.
@@ -82,13 +84,13 @@ To satisfy this need, the proposed system should:
 \section{C-Axis: Contribution and System Design}
 
 \subsection{Overview of the Proposed Pipeline}
-To address the problem, we propose a distributed AMR architecture composed of two communicating nodes. Machine A performs image acquisition and ROI detection using a lightweight YOLOv8n model. Machine B receives the cropped ROI over a TCP socket, segments the digits using classical image-processing steps, and classifies them with a custom CNN. This separation reduces the burden on the acquisition node while preserving modularity and flexibility.
+To address the problem, we propose a distributed AMR architecture composed of two communicating nodes. Machine~A performs image acquisition and ROI detection using a lightweight YOLOv8n model, then transmits the cropped digit strip to Machine~B over a TCP socket. Machine~B receives the ROI, segments the digits using a geometry-based approach, and classifies each one with a custom CNN. This separation reduces the inference burden on the acquisition node while preserving modularity and flexibility.
 
 \subsection{Distributed Architecture}
 The system is organized as follows:
 \begin{itemize}
-    \item \textbf{Machine A (Client):} captures the meter image, detects the ROI with YOLOv8n, crops the digit strip, and transmits only the cropped image data to the second node.
-    \item \textbf{Machine B (Server):} receives the cropped ROI, performs digit segmentation using OpenCV-based preprocessing, classifies each digit with a CNN, and reconstructs the final reading.
+    \item \textbf{Machine A (Client):} captures the meter image, detects the ROI with YOLOv8n (with rotation retry and OpenCV fallback), crops the digit strip, JPEG-encodes it, and transmits the bytes to Machine~B via a length-prefixed TCP protocol.
+    \item \textbf{Machine B (Server):} receives and decodes the JPEG ROI, splits it into five equal vertical strips, classifies each strip with a CNN, and returns the reconstructed reading string to Machine~A.
 \end{itemize}
 
 \begin{figure}[H]
@@ -100,8 +102,8 @@ The system is organized as follows:
     ]
     \node[box, fill=gray!10] (meter) {Raw Meter\\Image};
     \node[box, right=of meter, fill=blue!10] (machA) {\textbf{Machine A}\\YOLOv8 ROI Detection};
-    \node[box, right=of machA, fill=orange!10] (socket) {TCP Socket\\Image Bytes};
-    \node[box, below=of socket, fill=purple!10] (machB) {\textbf{Machine B}\\OpenCV + CNN};
+    \node[box, right=of machA, fill=orange!10] (socket) {TCP Socket\\JPEG Bytes};
+    \node[box, below=of socket, fill=purple!10] (machB) {\textbf{Machine B}\\Equal Split + CNN};
     \node[box, left=of machB, fill=green!10] (result) {Final Reading};
 
     \draw[arrow] (meter) -- (machA);
@@ -109,7 +111,7 @@ The system is organized as follows:
     \draw[arrow] (socket) -- (machB);
     \draw[arrow] (machB) -- (result);
     \end{tikzpicture}
-    \caption{Proposed distributed AMR pipeline with automatic ROI detection and remote digit inference.}
+    \caption{Proposed distributed AMR pipeline with automatic ROI detection on Machine~A and geometry-based digit segmentation on Machine~B.}
 \end{figure}
 
 \subsection{Automatic ROI Detection with YOLOv8}
@@ -125,22 +127,37 @@ A YOLOv8n model was trained to detect a single class, namely \textit{counter\_ro
     \caption{Example of autonomous ROI extraction using YOLOv8n. The detector isolates the digit strip without manual configuration.}
 \end{figure}
 
-\subsection{Digit Segmentation and CNN Classification}
-After ROI extraction, the cropped image is sent to Machine B for digit segmentation and classification. The segmentation pipeline uses a deterministic sequence of operations:
+\subsection{Rotation-Retry and Fallback Detection}
+To improve robustness under camera tilt, Machine~A implements a two-level fallback strategy executed entirely before any data is transmitted to Machine~B.
+
+\textbf{Level 1 — Rotation retry.}
+If YOLOv8n fails to detect any ROI on the original frame, the image is iteratively rotated using eight candidate angles: $[+10^\circ,\,-10^\circ,\,+20^\circ,\,-20^\circ,\,+30^\circ,\,-30^\circ,\,+45^\circ,\,-45^\circ]$. Each rotated view is tested independently. Rotation is performed with \texttt{cv2.warpAffine} using a full-canvas expansion (so no content is cropped), and the detected bounding box in the rotated frame is mapped back to the original coordinate system via the inverse affine transform. Crucially, when a rotated attempt succeeds, the ROI crop is extracted from the rotated frame itself, ensuring that the digit strip arrives at Machine~B in an upright orientation that is consistent with the CNN training distribution.
+
+\textbf{Level 2 — OpenCV geometric fallback.}
+If YOLO finds no ROI across all rotated views, a classical fallback estimates the counter window using morphological gradient filtering followed by Otsu binarization and contour analysis. Candidate rectangles are scored by area and aspect ratio (requiring a minimum ratio of 2.5:1 and a minimum width of 15\% of the frame), selecting the largest qualifying landscape region. A secondary pass using Canny edge detection is applied if the gradient pass returns no valid candidate.
+
+This layered approach ensures that even in degraded conditions, a best-effort ROI is always transmitted rather than silently discarding the frame.
+
+\subsection{Geometry-Based Digit Segmentation on Machine~B}
+After receiving and decoding the ROI, Machine~B performs digit segmentation using a deterministic geometry-based method. Since all target meters contain exactly five digits arranged in uniform-width drum cells, the ROI is divided into five equal vertical strips. Each strip uses a small overlap margin of approximately 2.5\% of the cell width on each side to prevent digits at cell boundaries from being clipped during the resize step.
+
+This approach eliminates all dependency on image binarization, thresholding, or projection-based boundary detection — operations that are notoriously fragile under uneven illumination, glare, or partial occlusion. The only information used is the known fixed structure of the meter counter: five equal-width digit cells.
+
+\subsection{CNN Digit Classification}
+Each extracted strip is preprocessed to match the training pipeline exactly:
 \begin{enumerate}
-    \item \textbf{Grayscale conversion and Gaussian blur:} reduce color noise and suppress local artifacts.
-    \item \textbf{Otsu thresholding:} binarize the ROI and emphasize the digit shapes.
-    \item \textbf{Morphological operations:} improve character continuity and remove small noisy components.
-    \item \textbf{Vertical projection:} identify blank columns between digits and extract character regions.
+    \item Resize to $20 \times 32$ pixels using bilinear interpolation (\texttt{INTER\_AREA}).
+    \item Convert from BGR to RGB channel order.
+    \item Cast to raw \texttt{float32} without dividing by 255 (Batch Normalization inside the CNN handles scale invariance).
 \end{enumerate}
+
+The prepared crop is then classified by a custom TensorFlow/Keras CNN trained on UFPR-AMR digit crops. The model outputs a probability distribution over 11 classes: digits 0 through 9, plus an additional \textit{N/NaN} class for unreadable or absent characters. The final reading is the concatenation of the five argmax predictions.
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.6\textwidth]{figures/cnn detection.png}
-    \caption{Digit segmentation and CNN inference on Machine B using the reading ``05866'' as an example.}
+    \caption{Digit segmentation and CNN inference on Machine~B. The ROI is split into five equal strips; each strip is classified independently.}
 \end{figure}
-
-Each segmented digit is resized to a 20$\times$32 RGB image and fed to a custom TensorFlow/Keras CNN. The classifier predicts 11 classes: digits 0 to 9, plus an additional \textit{N/NaN} class for unreadable or absent characters.
 
 \subsection{Training Data and Model Setup}
 The CNN was trained on 9,960 digit crops extracted from UFPR-AMR annotations. The dataset was split into 7,968 training samples and 1,992 hold-out test samples. Training was performed on raw pixel values without normalization by 255, and early stopping was used to avoid overfitting. The best model was recovered at epoch 104, while training stopped at epoch 124.
@@ -172,25 +189,66 @@ Exact full-reading match & 72.00\% (36/50) \\
 Correct text-length prediction & 76.00\% (38/50) \\
 \bottomrule
 \end{tabular}
-\caption{End-to-end evaluation on 50 meter images.}
+\caption{End-to-end evaluation on 50 meter images from the local test set.}
 \label{tab:endtoend}
 \end{table}
 
-\subsection{Error Analysis}
-The gap between component-level accuracy and end-to-end reading accuracy is mainly caused by segmentation failures. In particular, strong reflections and glare on the glass surface can reduce the visibility of spaces between digits. When this occurs, the vertical projection step may merge multiple digits into one region or miss some characters entirely. In one representative failure case, the reading ``21931'' was incorrectly reconstructed as ``43'' because the segmentation stage under-detected the character boundaries. Since the CNN performs well on isolated digits, the main weakness lies in the boundary extraction stage rather than the classifier itself.
+\subsection{Transfer Test on Moroccan Meters}
+An additional qualitative transfer test was conducted on 3 Moroccan field meters photographed at four rotation angles (0\textdegree, 10\textdegree, 30\textdegree, 45\textdegree), producing 12 images in total. The results are summarized in Table~\ref{tab:morocco}.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Meter} & \textbf{0\textdegree} & \textbf{10\textdegree} & \textbf{30\textdegree} & \textbf{45\textdegree} \\
+\midrule
+Meter 1 & $\checkmark$ 00956 & $\times$ YOLO wrong box & $\times$ No ROI & $\times$ No ROI \\
+Meter 2 & $\checkmark$ 22509 & $\checkmark$ 22509 & $\checkmark$ 22509 & $\sim$ 24506 (CNN) \\
+Meter 3 & $\sim$ 09738 (CNN) & $\checkmark$ 19738 & $\times$ 96986 (CNN) & $\times$ 96686 (CNN) \\
+\bottomrule
+\end{tabular}
+\caption{Transfer test results on 3 Moroccan field meters at four rotation angles (12 images total). $\checkmark$ = correct reading, $\times$ = failure, $\sim$ = partial digit error.}
+\label{tab:morocco}
+\end{table}
+
+Two distinct failure modes are identified:
+
+\textbf{Hardware-level failures (Meter 1, angles $\geq 10^\circ$).}
+Meter~1 failed YOLO detection at 10\textdegree\ (wrong bounding box) and produced no ROI at all at 30\textdegree\ and 45\textdegree. These failures are attributable to extreme camera tilt, not to model deficiencies. A standard axis-aligned object detector trained on upright meter images cannot be expected to reliably localize severely tilted targets. The correct mitigation is a physically stable camera mount rather than a software workaround. As a complementary safeguard, the system can emit a maintenance alert if the rotation-retry mechanism is consistently triggered, signaling potential camera drift to field operators.
+
+\textbf{CNN recognition failures (Meters 2 and 3, high angles).}
+Meter~2 produced one incorrect digit at 45\textdegree\ (\texttt{24506} instead of \texttt{22509}), and Meter~3 produced incorrect readings at 30\textdegree\ and 45\textdegree. Even at 0\textdegree, Meter~3 exhibited a digit confusion between \texttt{0} and \texttt{1} (\texttt{09738} instead of \texttt{19738}), while the reading at 10\textdegree\ was correct. These errors occur because when the camera is tilted, the YOLO-cropped ROI arrives at Machine~B in a skewed orientation. Resizing a skewed digit strip to $20 \times 32$ pixels introduces geometric distortion that causes the CNN to misclassify digits with visually similar class boundaries, such as \texttt{0} and \texttt{1}.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{figures/morocco_rot30_success.jpg}
+    \caption{Moroccan transfer example: Meter~2 at 30\textdegree\ is correctly read as \texttt{22509}, illustrating successful generalization to field conditions under moderate tilt.}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.75\textwidth]{figures/morocco_cnn_01_confusion.jpg}
+    \caption{Moroccan transfer failure: Meter~3 at 0\textdegree\ predicted \texttt{09738} instead of \texttt{19738} due to visual similarity between digit classes \texttt{0} and \texttt{1} under low local contrast.}
+\end{figure}
+
+Overall, 5 out of 12 Moroccan images produced fully correct readings. The three cases involving Meter~1 at angles above 0\textdegree\ represent hardware-placement failures; the remaining four partial or full errors are CNN recognition issues under tilt or low contrast. Importantly, the UFPR-AMR dataset and the Moroccan meters share the same mechanical drum-counter format, confirming that cross-distribution generalization holds under normal operating conditions.
+
+\subsection{Error Analysis on the Local Test Set}
+The gap between component-level accuracy and end-to-end reading accuracy on the local test set is mainly caused by recognition errors under challenging lighting. Strong reflections and glare on the glass surface can reduce local contrast for individual digit crops. When this occurs, the CNN may confuse visually adjacent digit classes even on correctly segmented strips. In one representative failure case from the local test set, a reading was reconstructed incorrectly due to multiple low-confidence digit predictions in a single frame affected by surface glare.
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.8\textwidth]{figures/cnn error.jpg}
-    \caption{Example of under-segmentation caused by glare and reflection, leading to an incorrect full reading.}
+    \caption{Representative failure case from the local test set: surface glare reduces digit crop contrast, leading to low-confidence CNN predictions and an incorrect final reading.}
 \end{figure}
 
 \subsection{System Limitations}
 While the proposed system demonstrates strong performance on the UFPR-AMR dataset distribution, it exhibits several generalization limitations consistent with the domain shift problem in computer vision:
 \begin{itemize}
-    \item \textbf{Novel Meter Types:} The YOLOv8 detector was trained exclusively on UFPR-AMR meters and struggles to generalize to completely unseen meter styles, colors, or shapes.
-    \item \textbf{Extreme Rotations:} The model relies on standard axis-aligned bounding boxes and limited rotation augmentation during training, leading to failures on heavily rotated images.
-    \item \textbf{Otsu Segmentation Assumptions:} The classical Otsu thresholding step assumes a bimodal grayscale distribution (e.g., dark digits on a light background). This assumption breaks down when applied to colored or heavily stylized meter dials, causing downstream segmentation failures.
+    \item \textbf{Novel Meter Types:} The YOLOv8 detector was trained exclusively on UFPR-AMR meters and may struggle to generalize to completely unseen meter styles, colors, or shapes.
+    \item \textbf{Extreme Camera Tilt:} The rotation-retry mechanism provides a software buffer for moderate angles, but beyond approximately 20\textdegree--30\textdegree, YOLO detection degrades significantly. This is fundamentally a hardware problem: the primary mitigation is a rigid camera mount with a defined installation tolerance. A software alert triggered by persistent rotation-retry usage serves as a secondary indicator of camera drift.
+    \item \textbf{Digit-Level Visual Ambiguity:} Visually similar digit classes (notably \texttt{0} vs.\ \texttt{1}) are occasionally confused under low contrast or tilt-induced distortion. This sensitivity arises from the resize step: a geometrically distorted crop loses discriminative structure that the CNN relies on.
+    \item \textbf{Optical Contamination:} Dust, condensation, or blur on the protective glass can alter local contrast and cause digit-level confusion even when ROI detection is correct.
 \end{itemize}
 These findings highlight the trade-off between the high accuracy achieved on in-distribution data and the challenges of zero-shot generalization to unconstrained real-world environments.
 
@@ -216,14 +274,14 @@ Salomon et al. \cite{laroca2020dial} & YOLOv4-based detection & AngReg-based rea
 \label{tab:benchmark}
 \end{table}
 
-As shown in the benchmark, classical pipelines remain sensitive to environmental variation, while manual-ROI edge systems do not scale well because they depend on user configuration. Deep-learning-based AMR systems such as that of Laroca et al.~\cite{laroca2021} demonstrate strong robustness and automation, but they are better aligned with centralized or resource-richer deployments than with minimal edge-only setups. The proposed distributed architecture addresses this gap by assigning lightweight ROI detection to the acquisition node and offloading the remaining recognition workload to a second node, thereby combining automation with practical deployment scalability.
+As shown in the benchmark, classical pipelines remain sensitive to environmental variation, while manual-ROI edge systems do not scale well. Deep-learning-based AMR systems such as that of Laroca et al.~\cite{laroca2021} demonstrate strong robustness and automation, but are better aligned with centralized deployments than minimal edge setups. The proposed distributed architecture addresses this gap by assigning lightweight ROI detection to the acquisition node and offloading recognition to a second node, combining automation with practical scalability.
 
 \section{Conclusion and Perspectives}
-This paper presented a fully automated distributed AMR system that combines YOLO-based ROI detection with CNN-based digit classification. The proposed architecture directly addresses the deployment bottleneck created by manual ROI configuration in existing edge-based workflows. By separating detection and inference across two nodes, the system also offers a practical path toward scalable and modular deployment.
+This paper presented a fully automated distributed AMR system combining YOLOv8-based ROI detection with geometry-driven digit segmentation and CNN-based classification. The proposed architecture directly addresses the deployment bottleneck created by manual ROI configuration in existing edge-based workflows. By separating detection and inference across two communicating nodes, the system also offers a practical path toward scalable and modular deployment.
 
-Experimental results show strong component-level performance, with 100\% ROI detection success and 99.00\% digit classification accuracy on the local test set. However, end-to-end performance remains limited by segmentation errors under difficult lighting conditions and generalization challenges on novel meter types. 
+Experimental results show strong component-level performance, with 100\% ROI detection success on the local test set and 99.00\% digit classification accuracy. End-to-end performance reaches 72\% exact reading match on the local set, and transfer tests on Moroccan meters confirm that the UFPR-AMR training distribution generalizes well under normal operating conditions (upright or near-upright camera placement).
 
-Future work should directly address these generalization constraints. To handle extreme rotations, the detection stage could be upgraded to use Oriented Bounding Boxes (OBB) or trained with aggressive affine augmentations. Furthermore, to overcome the limitations of Otsu segmentation and improve resilience against domain shifts (such as colored dials), the deterministic projection-based step should be replaced with a sequence modeling approach—such as a CRNN with CTC loss—or an end-to-end object detector for individual digits. This would eliminate hard segmentation assumptions, improving full-reading accuracy across diverse meter types and reducing sensitivity to glare.
+The primary identified failure modes are camera tilt beyond the effective range of the rotation-retry mechanism, and digit-level visual ambiguity under low contrast or geometric distortion. Both are well-understood limitations with clear mitigations. Tilt failures are a hardware-installation problem: the correct solution is a rigid camera mount and an installation quality checklist, complemented by a software alert that fires when the rotation-retry mechanism is repeatedly triggered, signaling camera drift to maintenance teams. CNN recognition errors can be addressed in future work by replacing the single-digit classifier with an end-to-end multi-output model that reads all five positions jointly from the full ROI in a single forward pass, eliminating the intermediate resize of individual strips and thereby reducing sensitivity to crop distortion. For deployments requiring support for variable digit counts or non-uniform cell spacing, a sequence modeling approach such as a CRNN with CTC loss would provide additional generalization without requiring knowledge of the digit count in advance.
 
 \begin{thebibliography}{99}
 
