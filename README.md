@@ -40,12 +40,12 @@ Open two terminals in the project root.
 
 Project root:
 
-`C:\Users\AGA GAMING\OneDrive\Desktop\roi jomjol`
+`C:\Users\username\roi jomjol`
 
 ### Terminal 1: Start Machine B server
 
 ```powershell
-cd "C:\Users\AGA GAMING\OneDrive\Desktop\roi jomjol"
+cd "C:\Users\username\roi jomjol"
 .\.venv\Scripts\Activate.ps1
 python machine_b\receive_and_read.py --host 127.0.0.1 --port 9999 --model-path models\cnn_model.keras --debug-dir machine_b\debug_outputs\run_test2
 ```
@@ -55,7 +55,7 @@ python machine_b\receive_and_read.py --host 127.0.0.1 --port 9999 --model-path m
 For test2 folder:
 
 ```powershell
-cd "C:\Users\AGA GAMING\OneDrive\Desktop\roi jomjol"
+cd "C:\Users\username\roi jomjol"
 .\.venv\Scripts\Activate.ps1
 python machine_a\detect_and_send.py --input test2 --model-path models\roi_model\yolo_model.pt --host 127.0.0.1 --port 9999 --output-dir machine_a\output\run_test2 --save-roi
 ```
@@ -63,7 +63,7 @@ python machine_a\detect_and_send.py --input test2 --model-path models\roi_model\
 For test_images folder:
 
 ```powershell
-cd "C:\Users\AGA GAMING\OneDrive\Desktop\roi jomjol"
+cd "C:\Users\username\roi jomjol"
 .\.venv\Scripts\Activate.ps1
 python machine_a\detect_and_send.py --input test_images --model-path models\roi_model\yolo_model.pt --host 127.0.0.1 --port 9999 --output-dir machine_a\output\run_local --save-roi
 ```
