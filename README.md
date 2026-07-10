@@ -71,7 +71,7 @@ python machine_a\detect_and_send.py --input test_images --model-path models\roi_
 For a single image:
 
 ```powershell
-cd "C:\Users\AGA GAMING\OneDrive\Desktop\roi jomjol"
+cd "C:\Users\username\roi jomjol"
 .\.venv\Scripts\Activate.ps1
 python machine_a\detect_and_send.py --input path\to\meter_image.jpg --model-path models\roi_model\yolo_model.pt --host 127.0.0.1 --port 9999 --output-dir machine_a\output\single_test --save-roi
 ```
